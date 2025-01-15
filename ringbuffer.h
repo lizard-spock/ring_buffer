@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>  
 #include <cstring>
  
 #define RING_SIZE           16777216
@@ -14,7 +15,6 @@
 #define CACHE_LINE          64
 #define INT_ALIGNED         16
  
-//define a generic class for atomic variable
 template <class C>
 using Atomic = std::atomic<C>;
 typedef char*        BufferT;
@@ -24,11 +24,11 @@ typedef unsigned int RingSizeT;
 struct RingBuffer {
        Atomic<int> ForwardTail[INT_ALIGNED];
        Atomic<int> SafeTail[INT_ALIGNED];
-       Atomic<int> Head[INT_ALIGNED];
+       int Head[INT_ALIGNED];
+       std::mutex ringMutex;
        char Buffer[RING_SIZE];
 };
 
-//create the entire ring buffer
 RingBuffer*
 AllocateMessageBuffer(
        BufferT BufferAddress
@@ -59,6 +59,9 @@ InsertToMessageBuffer(
        const BufferT CopyFrom,
        MessageSizeT MessageSize
 ) {
+       // std::cout << "start in InserToMessageBuffer" << std::endl;
+       std::lock_guard<std::mutex> lock(Ring->ringMutex);
+
        int forwardTail = Ring->ForwardTail[0];
        int head = Ring->Head[0];
        RingSizeT distance = 0;
@@ -69,67 +72,30 @@ InsertToMessageBuffer(
        else {
               distance = forwardTail - head;
        }
-       //if the write position is too much in advance, then disallow writing into buffer
+
        if (distance >= FORWARD_DEGREE) {
               return false;
        }
 
-       //align to cache_line size
        MessageSizeT messageBytes = sizeof(MessageSizeT) + MessageSize;
        while (messageBytes % CACHE_LINE != 0) {
               messageBytes++;
        }
  
-       //if the space left over is not enough for the new message size, return false
        if (messageBytes > RING_SIZE - distance) {
               return false;
        }
-       // std::cout << "here1" << std::endl;
-       while (Ring->ForwardTail[0].compare_exchange_weak(forwardTail, (forwardTail + messageBytes) % RING_SIZE) == false) {
-              // std::cout << "in while loop" << std::endl;
-              forwardTail = Ring->ForwardTail[0];
-              head = Ring->Head[0];
-              // int newhead = Ring->Head[0];
-              // if (head == newhead) {
-              //        break;
-              // }
-              // std::cout << "here" << std::endl;
-              // int newhead = Ring->Head[0];
-              // if (head != newhead) {
-              //        Ring->ForwardTail[0] = forwardTail;
-              //        continue;
-              // }
 
-              //Question: why above it's forwardTail < head, and now it's forwardTail <= head?? Does it makes a difference? 
-              //Q2: the distance is calculated using incorrect head (possibly)
-              if (forwardTail < head) {
-                     distance = forwardTail + RING_SIZE - head;
-              }
-              else {
-                     distance = forwardTail - head;
-              }
+       int newForwardTail = (forwardTail + messageBytes) % RING_SIZE;
  
-              if (distance >= FORWARD_DEGREE) {
-                     return false;
-              }
-
-              if (messageBytes > RING_SIZE - distance) {
-                     return false;
-              }
-       }
-       // std::cout << "here2" << std::endl;
  
-       if (forwardTail + messageBytes <= RING_SIZE) { //if no need to wrap around
+       if (forwardTail + messageBytes <= RING_SIZE) {
               char* messageAddress = &Ring->Buffer[forwardTail];
  
               *((MessageSizeT*)messageAddress) = messageBytes;
  
               memcpy(messageAddress + sizeof(MessageSizeT), CopyFrom, MessageSize);
- 
-              int safeTail = Ring->SafeTail[0];
-              while (Ring->SafeTail[0].compare_exchange_weak(safeTail, (safeTail + messageBytes) % RING_SIZE) == false) {
-                     safeTail = Ring->SafeTail[0];
-              }
+
        }
        else {
               RingSizeT remainingBytes = RING_SIZE - forwardTail - sizeof(MessageSizeT);
@@ -140,20 +106,16 @@ InsertToMessageBuffer(
                      memcpy(messageAddress1 + sizeof(MessageSizeT), CopyFrom, MessageSize);
               } else {
                      char* messageAddress2 = &Ring->Buffer[0];
-                     if (remainingBytes) { 
-                            // because remaining bytes are the size we can fit in the remaining in the buffer without the meta-data size 
+                     if (remainingBytes) {
                             memcpy(messageAddress1 + sizeof(MessageSizeT), CopyFrom, remainingBytes);
                      }
                      memcpy(messageAddress2, (const char*)CopyFrom + remainingBytes, MessageSize - remainingBytes);
               }
- 
-              int safeTail = Ring->SafeTail[0];
-              while (Ring->SafeTail[0].compare_exchange_weak(safeTail, (safeTail + messageBytes) % RING_SIZE) == false) {
-                     safeTail = Ring->SafeTail[0];
-              }
        }
-       // std::cout << "insert successful once" <<std::endl;
- 
+       
+       Ring->ForwardTail[0].store(newForwardTail, std::memory_order_relaxed);
+       Ring->SafeTail[0].store(newForwardTail,   std::memory_order_relaxed);
+       // std::cout << "return from insert" << std::endl;
        return true;
 }
  
@@ -163,53 +125,48 @@ FetchFromMessageBuffer(
        BufferT CopyTo,
        MessageSizeT* MessageSize
 ) {
+       std::lock_guard<std::mutex> lock(Ring->ringMutex);
+       // std::cout << "start Fetch" << std::endl;
        int forwardTail = Ring->ForwardTail[0];
        int safeTail = Ring->SafeTail[0];
        int head = Ring->Head[0];
  
-       //nothing to be read from, return false
        if (forwardTail == head) {
               return false;
        }
  
-       //if the producer has advanced the forwardTail (would like to write something)
-       //but not all content has been safely written into the buffer, return false
        if (forwardTail != safeTail) {
               return false;
        }
  
-       
        RingSizeT availBytes = 0;
        char* sourceBuffer1 = nullptr;
        char* sourceBuffer2 = nullptr;
  
-       if (safeTail > head) { //if safeTail is on the right of head 
-              //don't need to wrap around
+       if (safeTail > head) {
               availBytes = safeTail - head;
               *MessageSize = availBytes;
               sourceBuffer1 = &Ring->Buffer[head];
        }
        else {
-              //if wrapped around, then we need 2 buffers to copy into copyTo
               availBytes = RING_SIZE - head;
               *MessageSize = availBytes + safeTail;
               sourceBuffer1 = &Ring->Buffer[head];
               sourceBuffer2 = &Ring->Buffer[0];
        }
-       
-       //copy the first buffer, and then set the buffer to 0
+ 
        memcpy(CopyTo, sourceBuffer1, availBytes);
        memset(sourceBuffer1, 0, availBytes);
  
-       //if there's anything in source buffer 2, copy that, and set the var to 0 (same as deallocate?)
-       //Question: why not deallocate?
        if (sourceBuffer2) {
               memcpy((char*)CopyTo + availBytes, sourceBuffer2, safeTail);
               memset(sourceBuffer2, 0, safeTail);
        }
  
        Ring->Head[0] = safeTail;
+       // Ring->Head[0].store(safeTail, std::memory_order_relaxed);
  
+       // std::cout << "end Fetch" << std::endl;
        return true;
 }
  
@@ -222,14 +179,12 @@ ParseNextMessage(
        BufferT* StartOfNext,
        MessageSizeT* RemainingSize
 ) {
-       // std::cout << "parse next message start" << std::endl;
        char* bufferAddress = (char*)CopyTo;
        MessageSizeT totalBytes = *(MessageSizeT*)bufferAddress;
  
        *MessagePointer = (BufferT)(bufferAddress + sizeof(MessageSizeT));
        *MessageSize = totalBytes - sizeof(MessageSizeT);
        *RemainingSize = TotalSize - totalBytes;
-       // std::cout << "totalbytes: " << totalBytes << "total size: " << TotalSize << "remaining size:" << *RemainingSize << std::endl;
  
        if (*RemainingSize > 0) {
               *StartOfNext = (BufferT)(bufferAddress + totalBytes);

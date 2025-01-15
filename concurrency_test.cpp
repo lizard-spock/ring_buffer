@@ -3,7 +3,7 @@
 #include <chrono>
 #include <vector>
 #include <cassert>
-#include "concurrent_ringbuffer.h"
+#include "ringbuffer.h"
 
 #define MESSAGE_COUNT 1000000
 
@@ -20,9 +20,10 @@ void producer(RingBuffer* ring, uint64_t start_seq, uint64_t count) {
         msg.sequence = start_seq + i;
         while (!InsertToMessageBuffer(ring, (char*)&msg, sizeof(Message))) {
             // std::this_thread::yield();
+            // std::cout << "failed from insertToMessageBuffer" << std::endl;
         }
     }
-    // std::cout << "producer finish" << std::endl;
+    std::cout << "producer finish" << std::endl;
 }
 
 void consumer(RingBuffer* ring, uint64_t expected_count, std::vector<bool>& received) {
@@ -38,6 +39,7 @@ void consumer(RingBuffer* ring, uint64_t expected_count, std::vector<bool>& rece
             BufferT curr_bufferp = buffer;
             // std::cout << "total size left" << total_size_left << std::endl;
             while (total_size_left > 0) {
+                // std::cout << "here1" << std::endl;
               //while still something to read, read next message
               // std::cout << "get anything from buffer" << std::endl;
               BufferT msgPtr;
@@ -54,7 +56,7 @@ void consumer(RingBuffer* ring, uint64_t expected_count, std::vector<bool>& rece
               count++;
               curr_bufferp = nextPtr;
               total_size_left = remaining;
-              // std::cout << total_size_left <<std::endl;
+            //   std::cout << total_size_left <<std::endl;
             }
         }
         // } else {
@@ -68,36 +70,39 @@ void consumer(RingBuffer* ring, uint64_t expected_count, std::vector<bool>& rece
 
 void runMultipleProducerTest() {
     char* buffer = new char[sizeof(RingBuffer) + CACHE_LINE];
-    std::cout << "52" << std::endl;
     RingBuffer* ring = AllocateMessageBuffer(buffer);
     
-    std::vector<bool> received(MESSAGE_COUNT, false);
+    std::vector<bool> received(MESSAGE_COUNT*2, false);
     
     auto start = std::chrono::high_resolution_clock::now();
-    std::cout << "82" << std::endl;
-    std::thread producer_thread(producer, ring, 0, MESSAGE_COUNT);
-    std::cout << "63" << std::endl;
     
-    std::thread consumer_thread(consumer, ring, MESSAGE_COUNT, std::ref(received));
-    std::cout << "61" << std::endl;
+    std::thread consumer_thread(consumer, ring, MESSAGE_COUNT*2, std::ref(received));
+    std::cout << "78" << std::endl;
+    std::thread producer_thread(producer, ring, 0, MESSAGE_COUNT);
+    std::cout << "80" << std::endl;
+    std::thread producer_thread2(producer, ring, MESSAGE_COUNT, MESSAGE_COUNT);
+    std::cout << "82" << std::endl;
     
     producer_thread.join();
+    std::cout << "85" << std::endl;
+    producer_thread2.join();
+    std::cout << "87" << std::endl;
     consumer_thread.join();
+    std::cout << "89" << std::endl;
 
-    std::cout << "68" << std::endl;
-    
+
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
     // Verify all messages were received
-    for (uint64_t i = 0; i < MESSAGE_COUNT; i++) {
+    for (uint64_t i = 0; i != MESSAGE_COUNT*2; ++i) {
       if (received[i] == false) {
         std::cout << "missing message number " << i << std::endl;
       }
     }
     
-    double throughput = (MESSAGE_COUNT * 1000.0) / duration.count();
-    std::cout << "Single producer throughput: " << throughput << " messages/second\n";
+    double throughput = (MESSAGE_COUNT *2 * 1000.0) / duration.count();
+    std::cout << "Multiple producer throughput: " << throughput << " messages/second\n";
     
     delete[] buffer;
 }
